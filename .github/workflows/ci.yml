@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  PHPUnit:
+    name: PHPUnit (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php:
+          - 8.5
+          - 8.4
+          - 8.3
+          - 8.2
+          - 8.1
+          - 8.0
+          - 7.4
+          - 7.3
+          - 7.2
+          - 7.1
+          - 7.0
+          - 5.6
+          - 5.5
+          - 5.4
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: xdebug
+          ini-file: development
+      - run: composer install
+      - run: vendor/bin/phpunit --coverage-text --coverage-clover=clover.xml ${{ matrix.php < 7.3 && '-c phpunit.xml.legacy' || '' }}
+      - name: Check 100% code coverage
+        shell: php {0}
+        run: |
+          <?php
+          $metrics = simplexml_load_file('clover.xml')->project->metrics;
+          exit((int) $metrics['statements'] === (int) $metrics['coveredstatements'] ? 0 : 1);

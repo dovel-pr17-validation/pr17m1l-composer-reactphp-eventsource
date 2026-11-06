@@ -1,0 +1,301 @@
+<?php
+
+namespace Clue\React\EventSource;
+
+use Evenement\EventEmitter;
+use Psr\Http\Message\ResponseInterface;
+use React\EventLoop\Loop;
+use React\EventLoop\LoopInterface;
+use React\Http\Browser;
+use React\Http\Message\ResponseException;
+use React\Stream\ReadableStreamInterface;
+
+/**
+ * The `EventSource` class is responsible for communication with the remote Server-Sent Events (SSE) endpoint.
+ *
+ * The `EventSource` object works very similar to the one found in common
+ * web browsers. Unless otherwise noted, it follows the same semantics as defined
+ * under https://html.spec.whatwg.org/multipage/server-sent-events.html
+ *
+ * Its constructor simply requires the URL to the remote Server-Sent Events (SSE) endpoint:
+ *
+ * ```php
+ * $es = new Clue\React\EventSource\EventSource('https://example.com/stream.php');
+ * ```
+ *
+ * This class takes an optional `LoopInterface|null $loop` parameter that can be used to
+ * pass the event loop instance to use for this object. You can use a `null` value
+ * here in order to use the [default loop](https://github.com/reactphp/event-loop#loop).
+ * This value SHOULD NOT be given unless you're sure you want to explicitly use a
+ * given event loop instance.
+ *
+ * If you need custom connector settings (DNS resolution, TLS parameters, timeouts,
+ * proxy servers etc.), you can explicitly pass a custom instance of the
+ * [`ConnectorInterface`](https://github.com/reactphp/socket#connectorinterface)
+ * to the [`Browser`](https://github.com/reactphp/http#browser) instance
+ * and pass it as an additional argument to the `EventSource` like this:
+ *
+ * ```php
+ * $connector = new React\Socket\Connector(null, [
+ *     'dns' => '127.0.0.1',
+ *     'tcp' => [
+ *         'bindto' => '192.168.10.1:0'
+ *     ],
+ *     'tls' => [
+ *         'verify_peer' => false,
+ *         'verify_peer_name' => false
+ *     ]
+ * ]);
+ * $browser = new React\Http\Browser(null, $connector);
+ *
+ * $es = new Clue\React\EventSource\EventSource('https://example.com/stream.php', null, $browser);
+ * ```
+ */
+class EventSource extends EventEmitter
+{
+    // ready state
+    const CONNECTING = 0;
+    const OPEN = 1;
+    const CLOSED = 2;
+
+    /**
+     * @var int (read-only)
+     * @see self::CONNECTING
+     * @see self::OPEN
+     * @see self::CLOSED
+     * @psalm-readonly-allow-private-mutation
+     */
+    public $readyState = self::CLOSED;
+
+    /**
+     * @var string (read-only) URL
+     * @readonly
+     */
+    public $url;
+
+    /**
+     * @var string last event ID received
+     */
+    private $lastEventId = '';
+
+    /**
+     * @var LoopInterface
+     * @readonly
+     */
+    private $loop;
+
+    /**
+     * @var Browser
+     * @readonly
+     */
+    private $browser;
+
+    /**
+     * @var ?\React\Promise\PromiseInterface
+     */
+    private $request;
+
+    /**
+     * @var ?\React\EventLoop\TimerInterface
+     */
+    private $timer;
+
+    /**
+     * @var float
+     */
+    private $reconnectTime = 3.0;
+
+    /**
+     * The `EventSource` class is responsible for communication with the remote Server-Sent Events (SSE) endpoint.
+     *
+     * The `EventSource` object works very similar to the one found in common
+     * web browsers. Unless otherwise noted, it follows the same semantics as defined
+     * under https://html.spec.whatwg.org/multipage/server-sent-events.html
+     *
+     * Its constructor simply requires the URL to the remote Server-Sent Events (SSE) endpoint:
+     *
+     * ```php
+     * $es = new Clue\React\EventSource\EventSource('https://example.com/stream.php');
+     * ```
+     *
+     * If you need custom connector settings (DNS resolution, TLS parameters, timeouts,
+     * proxy servers etc.), you can explicitly pass a custom instance of the
+     * [`ConnectorInterface`](https://github.com/reactphp/socket#connectorinterface)
+     * to the [`Browser`](https://github.com/reactphp/http#browser) instance
+     * and pass it as an additional argument to the `EventSource` like this:
+     *
+     * ```php
+     * $connector = new React\Socket\Connector([
+     *     'dns' => '127.0.0.1',
+     *     'tcp' => [
+     *         'bindto' => '192.168.10.1:0'
+     *     ],
+     *     'tls' => [
+     *         'verify_peer' => false,
+     *         'verify_peer_name' => false
+     *     ]
+     * ]);
+     * $browser = new React\Http\Browser($connector);
+     *
+     * $es = new Clue\React\EventSource\EventSource('https://example.com/stream.php', $browser);
+     * ```
+     *
+     * This class takes an optional `LoopInterface|null $loop` parameter that can be used to
+     * pass the event loop instance to use for this object. You can use a `null` value
+     * here in order to use the [default loop](https://github.com/reactphp/event-loop#loop).
+     * This value SHOULD NOT be given unless you're sure you want to explicitly use a
+     * given event loop instance.
+     *
+     * @param string         $url
+     * @param ?Browser       $browser
+     * @param ?LoopInterface $loop
+     * @throws \InvalidArgumentException for invalid URL
+     */
+    public function __construct($url, $browser = null, $loop = null)
+    {
+        $parts = parse_url($url);
+        if (!isset($parts['scheme'], $parts['host']) || !in_array($parts['scheme'], array('http', 'https'))) {
+            throw new \InvalidArgumentException();
+        }
+
+        if ($browser !== null && !$browser instanceof Browser) { // manual type check to support legacy PHP < 7.1
+            throw new \InvalidArgumentException('Argument #2 ($browser) expected null|React\Http\Browser');
+        }
+        if ($loop !== null && !$loop instanceof LoopInterface) { // manual type check to support legacy PHP < 7.1
+            throw new \InvalidArgumentException('Argument #3 ($loop) expected null|React\EventLoop\LoopInterface');
+        }
+
+        $this->loop = $loop ?: Loop::get();
+        if ($browser === null) {
+            $browser = new Browser(null, $this->loop);
+        }
+        $this->browser = $browser->withRejectErrorResponse(false);
+        $this->url = $url;
+
+        $this->readyState = self::CONNECTING;
+        $this->request();
+    }
+
+    private function request()
+    {
+        $headers = array(
+            'Accept' => 'text/event-stream',
+            'Cache-Control' => 'no-cache'
+        );
+        if ($this->lastEventId !== '') {
+            $headers['Last-Event-ID'] = $this->lastEventId;
+        }
+
+        $this->request = $this->browser->requestStreaming(
+            'GET',
+            $this->url,
+            $headers
+        );
+        $this->request->then(function (ResponseInterface $response) {
+            if ($response->getStatusCode() !== 200) {
+                $this->readyState = self::CLOSED;
+                $this->emit('error', [new ResponseException(
+                    $response,
+                    'Expected "200 OK" response status, ' . $this->quote($response->getStatusCode() . ' ' . $response->getReasonPhrase()) . ' response status returned'
+                )]);
+                $this->close();
+                return;
+            }
+
+            // match `Content-Type: text/event-stream` (case insensitive and ignore additional parameters)
+            $contentType = $response->getHeaderLine('Content-Type');
+            if (!preg_match('/^text\/event-stream(?:$|;)/i', $contentType)) {
+                $this->readyState = self::CLOSED;
+                $this->emit('error', [new ResponseException(
+                    $response,
+                    'Expected "Content-Type: text/event-stream" response header, ' . (!$response->hasHeader('Content-Type') ? 'no "Content-Type"' : $this->quote('Content-Type: ' . $contentType)) . ' response header returned'
+                )]);
+                $this->close();
+                return;
+            }
+
+            $stream = $response->getBody();
+            assert($stream instanceof ReadableStreamInterface);
+
+            // resume from the last event ID received, it persists across reconnects
+            $sse = new SseDecoder($stream, $this->lastEventId);
+            $sse->on('data', function (MessageEvent $message) {
+                $this->emit($message->type, array($message));
+            });
+
+            $sse->on('close', function () use ($sse) {
+                // `id` and `retry` may arrive on events that are never dispatched
+                $this->lastEventId = $sse->lastEventId;
+                if ($sse->lastRetryTime !== null) {
+                    $this->reconnectTime = $sse->lastRetryTime;
+                }
+
+                $this->request = null;
+                if ($this->readyState === self::OPEN) {
+                    $this->readyState = self::CONNECTING;
+
+                    $this->emit('error', [new \RuntimeException('Stream closed, reconnecting in ' . $this->reconnectTime . ' seconds')]);
+                    if ($this->readyState === self::CLOSED) {
+                        return;
+                    }
+
+                    $this->timer = $this->loop->addTimer($this->reconnectTime, function () {
+                        $this->timer = null;
+                        $this->request();
+                    });
+                }
+            });
+
+            $this->readyState = self::OPEN;
+            $this->emit('open');
+        })->then(null, function ($e) {
+            $this->request = null;
+            if ($this->readyState === self::CLOSED) {
+                return;
+            }
+
+            $this->emit('error', [$e]);
+            if ($this->readyState === self::CLOSED) {
+                return;
+            }
+
+            $this->timer = $this->loop->addTimer($this->reconnectTime, function () {
+                $this->timer = null;
+                $this->request();
+            });
+        });
+    }
+
+    public function close()
+    {
+        $this->readyState = self::CLOSED;
+        if ($this->request !== null) {
+            $request = $this->request;
+            $this->request = null;
+
+            $request->then(function (ResponseInterface $response) {
+                $response->getBody()->close();
+            }, function () {
+                // ignore to avoid reporting unhandled rejection
+            });
+            $request->cancel();
+        }
+
+        if ($this->timer !== null) {
+            $this->loop->cancelTimer($this->timer);
+            $this->timer = null;
+        }
+
+        $this->removeAllListeners();
+    }
+
+    /**
+     * @param string $string
+     * @return string
+     * @throws void
+     */
+    private function quote($string)
+    {
+        return '"' . \addcslashes(\substr($string, 0, 100), "\x00..\x1f\"\\\x7f..\xff") . '"';
+    }
+}

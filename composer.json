@@ -1,0 +1,34 @@
+{
+    "name": "clue/reactphp-eventsource",
+    "description": "Instant real-time updates. Lightweight EventSource client receiving live messages via HTML5 Server-Sent Events (SSE). Fast stream processing built on top of ReactPHP's event-driven architecture.",
+    "keywords": ["EventSource", "Server-Side Events", "SSE", "event-driven", "ReactPHP", "async"],
+    "homepage": "https://github.com/clue/reactphp-eventsource",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Christian Lück",
+            "email": "christian@clue.engineering"
+        }
+    ],
+    "require": {
+        "php": ">=5.4",
+        "evenement/evenement": "^3.0 || ^2.0",
+        "react/event-loop": "^1.6",
+        "react/http": "^1.11",
+        "react/promise": "^3.3 || ^2.10 || ^1.2.1",
+        "react/stream": "^1.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6 || ^8.5 || ^5.7 || ^4.8.36"
+    },
+    "autoload": {
+        "psr-4": {
+            "Clue\\React\\EventSource\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Clue\\Tests\\React\\EventSource\\": "tests/"
+        }
+    }
+}
